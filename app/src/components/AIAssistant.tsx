@@ -844,24 +844,9 @@ export function AIAssistant() {
     // 杠后从牌墙末尾补牌
     if (next.wall.length > 0) {
       const draw = next.wall.pop()!;
-      if (draw === next.magicCard) {
-        me.magicReveals.push(draw);
-        appendLog(next, `我 开财神 ${draw}`);
-        if (next.wall.length === 0) {
-          next.finished = true;
-          next.winner = null;
-          appendLog(next, '牌墙为空，流局。');
-        } else {
-          // 单次只摸一张：开财神后结束本次流程，下一次再摸
-          next.stage = '摸牌';
-          setGame(next);
-          return;
-        }
-      } else {
-        me.hand = sortHand([...me.hand, draw]);
-        me.handCount = me.hand.length;
-        appendLog(next, `我 补牌 ${draw}`);
-      }
+      me.hand = sortHand([...me.hand, draw]);
+      me.handCount = me.hand.length;
+      appendLog(next, `我 补牌 ${draw}`);
     }
     next.stage = '打牌';
     setGame(next);
@@ -884,24 +869,9 @@ export function AIAssistant() {
     // 杠后从牌墙末尾补牌
     if (next.wall.length > 0) {
       const draw = next.wall.pop()!;
-      if (draw === next.magicCard) {
-        me.magicReveals.push(draw);
-        appendLog(next, `我 开财神 ${draw}`);
-        if (next.wall.length === 0) {
-          next.finished = true;
-          next.winner = null;
-          appendLog(next, '牌墙为空，流局。');
-        } else {
-          // 单次只摸一张：开财神后结束本次流程，下一次再摸
-          next.stage = '摸牌';
-          setGame(next);
-          return;
-        }
-      } else {
-        me.hand = sortHand([...me.hand, draw]);
-        me.handCount = me.hand.length;
-        appendLog(next, `我 补牌 ${draw}`);
-      }
+      me.hand = sortHand([...me.hand, draw]);
+      me.handCount = me.hand.length;
+      appendLog(next, `我 补牌 ${draw}`);
     }
     next.stage = '打牌';
     setGame(next);
@@ -944,19 +914,6 @@ export function AIAssistant() {
 
         // 对手摸牌：自动处理
         const draw = next.wall.shift() ?? '';
-        if (draw === next.magicCard) {
-          current.magicReveals.push(draw);
-          appendLog(next, `${current.name} 开财神 ${draw}`);
-          if (next.wall.length === 0) {
-            next.finished = true;
-            next.winner = null;
-            appendLog(next, '牌墙为空，流局。');
-          }
-          // 单次只摸一张：开财神后结束本次流程，下一次再摸
-          setGame(next);
-          return;
-        }
-
         if (draw) {
           current.handCount += 1;
           appendLog(next, `${current.name} 摸牌`);
@@ -1133,33 +1090,9 @@ export function AIAssistant() {
       next.wall.pop();
     }
 
-    // 检查是否摸到财神
-    if (tile === next.magicCard) {
-      me.magicReveals.push(tile);
-      appendLog(next, `我 开财神 ${tile}`);
-
-      // 牌墙为空则流局
-      if (next.wall.length === 0) {
-        next.finished = true;
-        next.winner = null;
-        appendLog(next, '牌墙为空，流局。');
-        setGame(next);
-        setMyDrawPrompt(null);
-        setSelectedDrawTile('');
-        return;
-      }
-
-      // 单次只摸一张：开财神后关闭本次弹窗，下一次摸牌再弹窗
-      next.stage = '摸牌';
-      setGame(next);
-      setSelectedDrawTile('');
-      setMyDrawPrompt(null);
-      return;
-    }
-
     me.hand = sortHand([...me.hand, tile]);
     me.handCount = me.hand.length;
-    appendLog(next, `我 摸牌 ${tile}`);
+    appendLog(next, tile === next.magicCard ? `我 摸牌 ${tile}（财神）` : `我 摸牌 ${tile}`);
     
     // 自摸胡检测
     if (canHuNow(me.hand, next.magicCard)) {

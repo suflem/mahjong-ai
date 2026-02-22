@@ -1108,17 +1108,10 @@ export function AIAssistant() {
         return;
       }
 
-      // 开财神后继续摸牌，重新计算可用牌并更新弹窗
-      const visible = buildVisibleTileCounts(next);
-      const availableTiles = ALL_TILE_LABELS.filter((t) => {
-        const remain = clamp(4 - (visible[t] ?? 0), 0, 4);
-        return remain > 0;
-      }).sort((a, b) => tileSortValue(a) - tileSortValue(b));
-
+      // 开财神后关闭弹窗，useEffect 会自动重新弹出摸牌弹窗
       setGame(next);
+      setMyDrawPrompt(null);
       setSelectedDrawTile('');
-      // 直接更新弹窗内容而不是关闭
-      setMyDrawPrompt({ availableTiles });
       return;
     }
 

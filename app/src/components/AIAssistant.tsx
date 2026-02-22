@@ -99,6 +99,7 @@ interface OpponentDiscardState {
   playerId: number;
   options: string[];
   selected: string;
+  openedMagic: boolean;
 }
 
 /** 自摸胡确认弹窗状态 */
@@ -354,6 +355,24 @@ function claimOptions(player: PlayerState, tile: string, magicCard: string) {
   };
 }
 
+function suggestClaimAction(player: PlayerState, tile: string, magicCard: string): Exclude<ClaimAction, '过'> | '过' {
+  const opts = claimOptions(player, tile, magicCard);
+  if (opts.hu) return '胡';
+
+  const baseScore = handStructureScore(player.hand);
+  if (opts.gang) {
+    const afterGang = removeNTiles(player.hand, tile, 3);
+    const gangScore = handStructureScore(afterGang) + 4;
+    if (gangScore >= baseScore + 1) return '杠';
+  }
+  if (opts.peng) {
+    const afterPeng = removeNTiles(player.hand, tile, 2);
+    const pengScore = handStructureScore(afterPeng) + 3;
+    if (pengScore >= baseScore + 0.5) return '碰';
+  }
+  return '过';
+}
+
 /** 检查暗杠机会：手牌中有4张相同 */
 function findAnGangOptions(hand: string[], magicCard: string): string[] {
   const counts: Record<string, number> = {};
@@ -510,6 +529,7 @@ function buildMetrics(game: RealtimeGame, analysis: LLMAnalysisResult | null): S
   }
 
   const unseenTotal = ALL_TILE_LABELS.reduce((sum, tile) => sum + clamp(4 - (visible[tile] ?? 0), 0, 4), 0);
+  const magicRemain = clamp(4 - (visible[game.magicCard] ?? 0), 0, 4);
   const base = handStructureScore(myHand);
   const drawCandidates = ALL_TILE_LABELS.map((tile) => {
     const remain = clamp(4 - (visible[tile] ?? 0), 0, 4);
@@ -536,7 +556,7 @@ function buildMetrics(game: RealtimeGame, analysis: LLMAnalysisResult | null): S
     .map((x) => x.tile);
 
   const phaseInsights = {
-    draw: `重点观察 ${drawCandidates.slice(0, 2).map((x) => x.tile).join(' / ') || '无高价值进张'}`,
+    draw: `重点观察 ${drawCandidates.slice(0, 2).map((x) => x.tile).join(' / ') || '无高价值进张'}；财神剩余约 ${magicRemain} 张`,
     discard: `推荐舍牌 ${preferred}，预计安全率 ${pct(safeRate)}`,
     wait: `三家听牌压力 ${pct(waitRisk)}，优先保留安全牌`
   };
@@ -627,7 +647,8 @@ function getActionGuideText(
     return `请输入你观察到的 ${game.players[pendingOpponentDiscard.playerId].name} 弃牌`;
   }
   if (myPendingClaim) {
-    return `对手打出 ${myPendingClaim.tile}，你可以 ${myPendingClaim.options.hu ? '胡/' : ''}${myPendingClaim.options.peng ? '碰/' : ''}${myPendingClaim.options.gang ? '杠/' : ''}过`;
+    const suggested = suggestClaimAction(game.players[0], myPendingClaim.tile, game.magicCard);
+    return `对手打出 ${myPendingClaim.tile}，你可以 ${myPendingClaim.options.hu ? '胡/' : ''}${myPendingClaim.options.peng ? '碰/' : ''}${myPendingClaim.options.gang ? '杠/' : ''}过（建议: ${suggested}）`;
   }
   if (anGangOptions.length > 0) {
     return `你有暗杠机会: ${anGangOptions.join('、')}，是否暗杠？`;
@@ -667,6 +688,8 @@ export function AIAssistant() {
   const [selfDrawHuPrompt, setSelfDrawHuPrompt] = useState<SelfDrawHuPrompt | null>(null);
   const [myDrawPrompt, setMyDrawPrompt] = useState<MyDrawPrompt | null>(null);
   const [selectedDrawTile, setSelectedDrawTile] = useState('');
+  const [manualOpponentId, setManualOpponentId] = useState(1);
+  const [manualActionTile, setManualActionTile] = useState<string>(ALL_TILE_LABELS[0] ?? '1万');
 
   const gameRef = useRef(game);
   const isAdvancingRef = useRef(false);
@@ -702,6 +725,29 @@ export function AIAssistant() {
     getActionGuideText(activeGame, pendingOpponentDiscard, myPendingClaim, selfDrawHuPrompt, anGangOptions, jiaGangOptions, metrics, myDrawPrompt),
     [activeGame, pendingOpponentDiscard, myPendingClaim, selfDrawHuPrompt, anGangOptions, jiaGangOptions, metrics, myDrawPrompt]
   );
+  const decisionTips = useMemo(() => {
+    const tips: string[] = [];
+    if (myDrawPrompt) {
+      tips.push(`摸牌决策：若摸到财神 ${activeGame.magicCard}，可记录“开财神”并继续按常规打牌。`);
+    }
+    if (myPendingClaim) {
+      const suggested = suggestClaimAction(activeGame.players[0], myPendingClaim.tile, activeGame.magicCard);
+      tips.push(`接牌决策：对手打出 ${myPendingClaim.tile}，建议 ${suggested}。`);
+    }
+    if (anGangOptions.length > 0) {
+      tips.push(`杠牌决策：可暗杠 ${anGangOptions.join(' / ')}，优先在安全局面执行。`);
+    }
+    if (jiaGangOptions.length > 0) {
+      tips.push(`杠牌决策：可加杠 ${jiaGangOptions.join(' / ')}，注意抬高被针对风险。`);
+    }
+    if (pendingOpponentDiscard?.openedMagic) {
+      tips.push(`对手动作：本次已标记 ${activeGame.players[pendingOpponentDiscard.playerId].name} 先开财神。`);
+    }
+    if (tips.length === 0) {
+      tips.push('当前无高优先级特殊动作，按“摸牌 → 打牌 → 等待”推进。');
+    }
+    return tips;
+  }, [myDrawPrompt, myPendingClaim, anGangOptions, jiaGangOptions, pendingOpponentDiscard, activeGame]);
 
   // === LLM helpers ===
   const buildContext = useCallback((snapshot: RealtimeGame): MahjongContext => {
@@ -759,9 +805,25 @@ export function AIAssistant() {
   const runStrategyForCurrentTurn = useCallback(async (snapshot: RealtimeGame) => {
     const turnKey = `${snapshot.turn}-${snapshot.currentPlayer}-${snapshot.stage}`;
     if (llmTurnKey === turnKey || !config.apiKey.trim()) return analysis;
+    const claim = getMyPendingClaim(snapshot);
+    const anGang = findAnGangOptions(snapshot.players[0].hand, snapshot.magicCard);
+    const jiaGang = findJiaGangOptions(snapshot.players[0].hand, snapshot.players[0].pengSets);
+    const decisionHints: string[] = [];
+    if (snapshot.currentPlayer === 0 && snapshot.stage === '摸牌') {
+      decisionHints.push(`若摸到财神 ${snapshot.magicCard}，请给出是否应记录开财神的建议。`);
+    }
+    if (claim) {
+      decisionHints.push(`当前可接牌 ${claim.tile}：胡=${claim.options.hu} 碰=${claim.options.peng} 杠=${claim.options.gang}。`);
+    }
+    if (anGang.length > 0) {
+      decisionHints.push(`当前可暗杠: ${anGang.join('、')}。`);
+    }
+    if (jiaGang.length > 0) {
+      decisionHints.push(`当前可加杠: ${jiaGang.join('、')}。`);
+    }
     const result = await runLLM(
       snapshot,
-      `当前阶段=${snapshot.stage}，当前玩家=${snapshot.players[snapshot.currentPlayer].name}。请给出可执行策略。`,
+      `当前阶段=${snapshot.stage}，当前玩家=${snapshot.players[snapshot.currentPlayer].name}。请给出可执行策略，覆盖摸牌/开财神/碰杠决策。${decisionHints.join(' ')}`,
       history
     );
     if (result) setLlmTurnKey(turnKey);
@@ -953,7 +1015,8 @@ export function AIAssistant() {
         setPendingOpponentDiscard({
           playerId: next.currentPlayer,
           options,
-          selected: options[0]
+          selected: options[0],
+          openedMagic: false
         });
         setGame(next);
         return;
@@ -1023,6 +1086,8 @@ export function AIAssistant() {
     setSelfDrawHuPrompt(null);
     setMyDrawPrompt(null);
     setSelectedDrawTile('');
+    setManualOpponentId(1);
+    setManualActionTile(ALL_TILE_LABELS[0] ?? '1万');
   };
 
   const startGame = () => {
@@ -1038,6 +1103,10 @@ export function AIAssistant() {
     setPendingOpponentDiscard(null);
     setSelectedMyDiscard('');
     setSelfDrawHuPrompt(null);
+    setMyDrawPrompt(null);
+    setSelectedDrawTile('');
+    setManualOpponentId(1);
+    setManualActionTile(ALL_TILE_LABELS[0] ?? '1万');
   };
 
   const confirmMyDiscard = () => {
@@ -1115,14 +1184,48 @@ export function AIAssistant() {
     if (game.stage !== '打牌' || game.currentPlayer !== pendingOpponentDiscard.playerId) return;
     const tile = pendingOpponentDiscard.selected || pendingOpponentDiscard.options[0];
     if (!tile) return;
+    let next = cloneGame(game);
+    if (pendingOpponentDiscard.openedMagic) {
+      const current = next.players[pendingOpponentDiscard.playerId];
+      current.magicReveals.push(next.magicCard);
+      appendLog(next, `${current.name} 开财神 ${next.magicCard}（出牌阶段记录）`);
+    }
     setPendingOpponentDiscard(null);
-    setGame(performDiscard(game, tile));
+    next = performDiscard(next, tile);
+    setGame(next);
   };
 
   const randomOpponentDiscard = () => {
     if (!pendingOpponentDiscard) return;
     const choice = pendingOpponentDiscard.options[Math.floor(Math.random() * pendingOpponentDiscard.options.length)];
     setPendingOpponentDiscard((prev) => prev ? { ...prev, selected: choice } : prev);
+  };
+
+  const recordOpponentMeld = (action: '碰' | '杠') => {
+    if (!game || game.finished) return;
+    if (![1, 2, 3].includes(manualOpponentId)) return;
+    const next = cloneGame(game);
+    const target = next.players[manualOpponentId];
+    if (!target) return;
+
+    if (action === '碰') {
+      target.pengSets.push([manualActionTile, manualActionTile, manualActionTile]);
+      target.handCount = Math.max(0, target.handCount - 2);
+    } else {
+      target.gangSets.push([manualActionTile, manualActionTile, manualActionTile, manualActionTile]);
+      target.handCount = Math.max(0, target.handCount - 3);
+    }
+
+    if (next.tableDiscards.length > 0 && next.tableDiscards[next.tableDiscards.length - 1] === manualActionTile) {
+      next.tableDiscards = next.tableDiscards.slice(0, -1);
+      if (next.lastDiscard?.tile === manualActionTile) {
+        next.lastDiscard = null;
+        next.claimWindow = false;
+      }
+    }
+
+    appendLog(next, `${target.name} ${action} ${manualActionTile}（手动记录）`);
+    setGame(next);
   };
 
   const askCurrentStrategy = async () => {
@@ -1391,6 +1494,15 @@ export function AIAssistant() {
                   ))}
                 </div>
               </div>
+
+              <div className="rounded bg-emerald-50 p-3">
+                <div className="font-medium">关键决策建议</div>
+                <div className="mt-1 space-y-1">
+                  {decisionTips.slice(0, 4).map((tip, idx) => (
+                    <div key={`${tip}-${idx}`} className="text-xs text-slate-700">{tip}</div>
+                  ))}
+                </div>
+              </div>
             </CardContent>
           </Card>
 
@@ -1457,6 +1569,39 @@ export function AIAssistant() {
             </CardContent>
           </Card>
 
+          <Card className="border-l-4 border-l-violet-500">
+            <CardHeader className="py-3">
+              <CardTitle className="text-lg">对手动作录入</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2 text-sm">
+              <div className="text-xs text-slate-600">可在任意时机记录对手碰/杠；开财神请在对手出牌弹窗中勾选。</div>
+              <div className="grid grid-cols-2 gap-2">
+                <select
+                  className="h-9 rounded border bg-white px-2"
+                  value={manualOpponentId}
+                  onChange={(e) => setManualOpponentId(Number(e.target.value))}
+                >
+                  <option value={1}>下家</option>
+                  <option value={2}>对家</option>
+                  <option value={3}>上家</option>
+                </select>
+                <select
+                  className="h-9 rounded border bg-white px-2"
+                  value={manualActionTile}
+                  onChange={(e) => setManualActionTile(e.target.value)}
+                >
+                  {ALL_TILE_LABELS.map((tile) => (
+                    <option key={`manual-${tile}`} value={tile}>{tile}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button size="sm" variant="outline" onClick={() => recordOpponentMeld('碰')}>记录碰</Button>
+                <Button size="sm" variant="outline" onClick={() => recordOpponentMeld('杠')}>记录杠</Button>
+              </div>
+            </CardContent>
+          </Card>
+
           <Card className="border-l-4 border-l-blue-500">
             <CardHeader className="py-3">
               <CardTitle className="text-lg flex items-center gap-2"><UserRound className="h-5 w-5" />实时动作流</CardTitle>
@@ -1503,6 +1648,9 @@ export function AIAssistant() {
                 <div className="text-sm text-slate-600">
                   当前为 <strong>{game?.players[pendingOpponentDiscard.playerId].name}</strong> 的打牌阶段，请选择你在牌桌上观察到的弃牌。
                 </div>
+                <div className="rounded border border-amber-200 bg-amber-50 px-2 py-2 text-xs text-amber-800">
+                  若该对手本轮先开了财神，再打出本牌，请先切换下方“已开财神”。
+                </div>
                 {suitSections.map((section) => (
                   <div key={section.key}>
                     <div className="mb-1 text-xs font-medium text-slate-500">{section.label}</div>
@@ -1534,6 +1682,12 @@ export function AIAssistant() {
                 <div className="flex items-center gap-2">
                   <Button onClick={confirmOpponentDiscard}>确认</Button>
                   <Button variant="outline" onClick={randomOpponentDiscard}>随机一张</Button>
+                  <Button
+                    variant={pendingOpponentDiscard.openedMagic ? 'default' : 'outline'}
+                    onClick={() => setPendingOpponentDiscard((prev) => prev ? { ...prev, openedMagic: !prev.openedMagic } : prev)}
+                  >
+                    {pendingOpponentDiscard.openedMagic ? '已开财神' : '标记开财神'}
+                  </Button>
                   <span className="text-xs text-slate-500">已选: {pendingOpponentDiscard.selected}</span>
                 </div>
               </div>

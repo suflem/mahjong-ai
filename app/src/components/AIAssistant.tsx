@@ -102,6 +102,12 @@ interface OpponentDiscardState {
   openedMagic: boolean;
 }
 
+interface OpponentClaimPromptState {
+  tile: string;
+  by: number;
+  options: Array<{ playerId: number; action: '碰' | '杠' }>;
+}
+
 /** 自摸胡确认弹窗状态 */
 interface SelfDrawHuPrompt {
   playerId: number;
@@ -588,6 +594,20 @@ function getMyPendingClaim(game: RealtimeGame): { tile: string; by: number; opti
   return { tile: game.lastDiscard.tile, by: game.lastDiscard.by, options: opts };
 }
 
+function getOpponentClaimPrompt(game: RealtimeGame): OpponentClaimPromptState | null {
+  if (!game.claimWindow || !game.lastDiscard || game.stage !== '等待') return null;
+  const tile = game.lastDiscard.tile;
+  const by = game.lastDiscard.by;
+  const options: Array<{ playerId: number; action: '碰' | '杠' }> = [];
+  for (let pid = 1; pid <= 3; pid += 1) {
+    if (pid === by) continue;
+    options.push({ playerId: pid, action: '碰' });
+    options.push({ playerId: pid, action: '杠' });
+  }
+  if (options.length === 0) return null;
+  return { tile, by, options };
+}
+
 function appendLog(game: RealtimeGame, message: string) {
   const nextCount = game.actionCount + 1;
   game.actionCount = nextCount;
@@ -620,10 +640,22 @@ function formatCost(v: number) {
   return `¥${v.toFixed(4)}`;
 }
 
+function buildTileLedger(game: RealtimeGame) {
+  const setTiles = game.players.reduce((sum, p) => (
+    sum + p.pengSets.reduce((s, set) => s + set.length, 0) + p.gangSets.reduce((s, set) => s + set.length, 0)
+  ), 0);
+  const revealedMagicTiles = game.players.reduce((sum, p) => sum + p.magicReveals.length, 0);
+  const opponentHidden = game.players.slice(1).reduce((sum, p) => sum + p.handCount, 0);
+  const indicator = game.magicCard ? 1 : 0;
+  const total = game.wall.length + game.players[0].hand.length + opponentHidden + game.tableDiscards.length + setTiles + revealedMagicTiles + indicator;
+  return { total, setTiles, revealedMagicTiles, indicator };
+}
+
 /** 生成当前阶段的操作指引文本 */
 function getActionGuideText(
   game: RealtimeGame,
   pendingOpponentDiscard: OpponentDiscardState | null,
+  pendingOpponentClaimPrompt: OpponentClaimPromptState | null,
   myPendingClaim: ReturnType<typeof getMyPendingClaim>,
   selfDrawHuPrompt: SelfDrawHuPrompt | null,
   anGangOptions: string[],
@@ -639,6 +671,9 @@ function getActionGuideText(
   }
   if (myDrawPrompt) {
     return '请选择你摸到的牌';
+  }
+  if (pendingOpponentClaimPrompt) {
+    return `请先确认是否有对手对 ${pendingOpponentClaimPrompt.tile} 进行碰/杠`;
   }
   if (game.currentPlayer === 0 && game.stage === '摸牌') {
     return '点击“摸牌”后输入本次摸到的牌（每次仅一张）';
@@ -684,12 +719,14 @@ export function AIAssistant() {
   const [isLLMRunning, setIsLLMRunning] = useState(false);
   const [llmTurnKey, setLlmTurnKey] = useState('');
   const [pendingOpponentDiscard, setPendingOpponentDiscard] = useState<OpponentDiscardState | null>(null);
+  const [pendingOpponentClaimPrompt, setPendingOpponentClaimPrompt] = useState<OpponentClaimPromptState | null>(null);
   const [selectedMyDiscard, setSelectedMyDiscard] = useState('');
   const [selfDrawHuPrompt, setSelfDrawHuPrompt] = useState<SelfDrawHuPrompt | null>(null);
   const [myDrawPrompt, setMyDrawPrompt] = useState<MyDrawPrompt | null>(null);
   const [selectedDrawTile, setSelectedDrawTile] = useState('');
   const [manualOpponentId, setManualOpponentId] = useState(1);
   const [manualActionTile, setManualActionTile] = useState<string>(ALL_TILE_LABELS[0] ?? '1万');
+  const [drawHint, setDrawHint] = useState('');
 
   const gameRef = useRef(game);
   const isAdvancingRef = useRef(false);
@@ -710,6 +747,12 @@ export function AIAssistant() {
   const analysisForCurrentTurn = llmTurnKey === currentTurnKey ? analysis : null;
   const metrics = useMemo(() => buildMetrics(activeGame, analysisForCurrentTurn), [activeGame, analysisForCurrentTurn]);
   const myPendingClaim = useMemo(() => getMyPendingClaim(activeGame), [activeGame]);
+  const tileLedger = useMemo(() => buildTileLedger(activeGame), [activeGame]);
+  const magicVisibleRemain = useMemo(() => {
+    if (!activeGame.magicCard) return 0;
+    const visible = buildVisibleTileCounts(activeGame);
+    return clamp(4 - (visible[activeGame.magicCard] ?? 0), 0, 4);
+  }, [activeGame]);
 
   // 暗杠/加杠检测
   const anGangOptions = useMemo(() => {
@@ -722,8 +765,8 @@ export function AIAssistant() {
   }, [game]);
 
   const actionGuide = useMemo(() =>
-    getActionGuideText(activeGame, pendingOpponentDiscard, myPendingClaim, selfDrawHuPrompt, anGangOptions, jiaGangOptions, metrics, myDrawPrompt),
-    [activeGame, pendingOpponentDiscard, myPendingClaim, selfDrawHuPrompt, anGangOptions, jiaGangOptions, metrics, myDrawPrompt]
+    getActionGuideText(activeGame, pendingOpponentDiscard, pendingOpponentClaimPrompt, myPendingClaim, selfDrawHuPrompt, anGangOptions, jiaGangOptions, metrics, myDrawPrompt),
+    [activeGame, pendingOpponentDiscard, pendingOpponentClaimPrompt, myPendingClaim, selfDrawHuPrompt, anGangOptions, jiaGangOptions, metrics, myDrawPrompt]
   );
   const decisionTips = useMemo(() => {
     const tips: string[] = [];
@@ -748,6 +791,11 @@ export function AIAssistant() {
     }
     return tips;
   }, [myDrawPrompt, myPendingClaim, anGangOptions, jiaGangOptions, pendingOpponentDiscard, activeGame]);
+  useEffect(() => {
+    if (!drawHint) return;
+    const timer = setTimeout(() => setDrawHint(''), 1400);
+    return () => clearTimeout(timer);
+  }, [drawHint]);
 
   // === LLM helpers ===
   const buildContext = useCallback((snapshot: RealtimeGame): MahjongContext => {
@@ -909,6 +957,7 @@ export function AIAssistant() {
       me.hand = sortHand([...me.hand, draw]);
       me.handCount = me.hand.length;
       appendLog(next, `我 补牌 ${draw}`);
+      setDrawHint(`暗杠补牌 ${draw}`);
     }
     next.stage = '打牌';
     setGame(next);
@@ -934,6 +983,7 @@ export function AIAssistant() {
       me.hand = sortHand([...me.hand, draw]);
       me.handCount = me.hand.length;
       appendLog(next, `我 补牌 ${draw}`);
+      setDrawHint(`加杠补牌 ${draw}`);
     }
     next.stage = '打牌';
     setGame(next);
@@ -943,7 +993,7 @@ export function AIAssistant() {
   const advanceStep = useCallback(async () => {
     if (!game || game.finished) return;
     if (isAdvancingRef.current || isLLMRunning) return;
-    if (pendingOpponentDiscard || myPendingClaim || selfDrawHuPrompt || myDrawPrompt) return;
+    if (pendingOpponentDiscard || pendingOpponentClaimPrompt || myPendingClaim || selfDrawHuPrompt || myDrawPrompt) return;
 
     isAdvancingRef.current = true;
     try {
@@ -979,6 +1029,7 @@ export function AIAssistant() {
         if (draw) {
           current.handCount += 1;
           appendLog(next, `${current.name} 摸牌`);
+          setDrawHint(`${current.name} 摸牌`);
           next.stage = '打牌';
           setGame(next);
           return;
@@ -1033,6 +1084,15 @@ export function AIAssistant() {
             setGame(next);
             return;
           }
+          const oppPrompt = getOpponentClaimPrompt(next);
+          if (oppPrompt) {
+            if (!next.lastAction.includes('等待你确认是否有对手碰/杠')) {
+              appendLog(next, `对手打出 ${oppPrompt.tile}，等待你确认是否有对手碰/杠`);
+            }
+            setPendingOpponentClaimPrompt(oppPrompt);
+            setGame(next);
+            return;
+          }
         }
         // 无可接牌动作，自动过
         resolveWaitPass(next);
@@ -1041,12 +1101,12 @@ export function AIAssistant() {
     } finally {
       isAdvancingRef.current = false;
     }
-  }, [game, isLLMRunning, pendingOpponentDiscard, myPendingClaim, selfDrawHuPrompt, myDrawPrompt, config.apiKey, performDiscard, runStrategyForCurrentTurn]);
+  }, [game, isLLMRunning, pendingOpponentDiscard, pendingOpponentClaimPrompt, myPendingClaim, selfDrawHuPrompt, myDrawPrompt, config.apiKey, performDiscard, runStrategyForCurrentTurn]);
 
   // 自动推进 useEffect
   useEffect(() => {
     if (setupPhase !== '进行中' || !game || game.finished) return;
-    if (pendingOpponentDiscard || myPendingClaim || selfDrawHuPrompt || myDrawPrompt) return;
+    if (pendingOpponentDiscard || pendingOpponentClaimPrompt || myPendingClaim || selfDrawHuPrompt || myDrawPrompt) return;
     // 玩家0的摸牌/打牌都由用户触发，避免自动连环推进
     if (game.currentPlayer === 0 && (game.stage === '打牌' || game.stage === '摸牌')) return;
 
@@ -1056,7 +1116,7 @@ export function AIAssistant() {
       }
     }, 600);
     return () => clearTimeout(timer);
-  }, [setupPhase, game, pendingOpponentDiscard, myPendingClaim, selfDrawHuPrompt, myDrawPrompt, isLLMRunning, advanceStep]);
+  }, [setupPhase, game, pendingOpponentDiscard, pendingOpponentClaimPrompt, myPendingClaim, selfDrawHuPrompt, myDrawPrompt, isLLMRunning, advanceStep]);
 
   // 自动触发LLM策略
   useEffect(() => {
@@ -1082,12 +1142,14 @@ export function AIAssistant() {
     setError('');
     setLlmTurnKey('');
     setPendingOpponentDiscard(null);
+    setPendingOpponentClaimPrompt(null);
     setSelectedMyDiscard('');
     setSelfDrawHuPrompt(null);
     setMyDrawPrompt(null);
     setSelectedDrawTile('');
     setManualOpponentId(1);
     setManualActionTile(ALL_TILE_LABELS[0] ?? '1万');
+    setDrawHint('');
   };
 
   const startGame = () => {
@@ -1101,12 +1163,14 @@ export function AIAssistant() {
     setError('');
     setLlmTurnKey('');
     setPendingOpponentDiscard(null);
+    setPendingOpponentClaimPrompt(null);
     setSelectedMyDiscard('');
     setSelfDrawHuPrompt(null);
     setMyDrawPrompt(null);
     setSelectedDrawTile('');
     setManualOpponentId(1);
     setManualActionTile(ALL_TILE_LABELS[0] ?? '1万');
+    setDrawHint('');
   };
 
   const confirmMyDiscard = () => {
@@ -1125,6 +1189,12 @@ export function AIAssistant() {
     if (action === '过') {
       const next = cloneGame(game);
       appendLog(next, `你选择过 ${pending.tile}`);
+      const oppPrompt = getOpponentClaimPrompt(next);
+      if (oppPrompt) {
+        setPendingOpponentClaimPrompt(oppPrompt);
+        setGame(next);
+        return;
+      }
       resolveWaitPass(next);
       setGame(next);
       return;
@@ -1162,6 +1232,7 @@ export function AIAssistant() {
     me.hand = sortHand([...me.hand, tile]);
     me.handCount = me.hand.length;
     appendLog(next, tile === next.magicCard ? `我 摸牌 ${tile}（财神）` : `我 摸牌 ${tile}`);
+    setDrawHint(tile === next.magicCard ? `摸到财神 ${tile}` : `摸到 ${tile}`);
     
     // 自摸胡检测
     if (canHuNow(me.hand, next.magicCard)) {
@@ -1179,6 +1250,34 @@ export function AIAssistant() {
     setSelectedDrawTile('');
   };
 
+  const handleMyOpenMagic = () => {
+    if (!game || game.finished || game.currentPlayer !== 0 || game.stage !== '打牌') return;
+    const next = cloneGame(game);
+    const me = next.players[0];
+    const idx = me.hand.indexOf(next.magicCard);
+    if (idx < 0) return;
+
+    me.hand = [...me.hand.slice(0, idx), ...me.hand.slice(idx + 1)];
+    me.magicReveals.push(next.magicCard);
+    appendLog(next, `我 开财神 ${next.magicCard}（手动）`);
+
+    if (next.wall.length === 0) {
+      next.finished = true;
+      next.winner = null;
+      appendLog(next, '牌墙为空，流局。');
+      setGame(next);
+      return;
+    }
+
+    const draw = next.wall.shift()!;
+    me.hand = sortHand([...me.hand, draw]);
+    me.handCount = me.hand.length;
+    appendLog(next, `我 补牌 ${draw}`);
+    setDrawHint(`开财神后补牌 ${draw}`);
+
+    setGame(next);
+  };
+
   const confirmOpponentDiscard = () => {
     if (!pendingOpponentDiscard || !game) return;
     if (game.stage !== '打牌' || game.currentPlayer !== pendingOpponentDiscard.playerId) return;
@@ -1189,6 +1288,16 @@ export function AIAssistant() {
       const current = next.players[pendingOpponentDiscard.playerId];
       current.magicReveals.push(next.magicCard);
       appendLog(next, `${current.name} 开财神 ${next.magicCard}（出牌阶段记录）`);
+      if (next.wall.length === 0) {
+        next.finished = true;
+        next.winner = null;
+        appendLog(next, '牌墙为空，流局。');
+        setPendingOpponentDiscard(null);
+        setGame(next);
+        return;
+      }
+      next.wall.shift();
+      appendLog(next, `${current.name} 开财神后补牌`);
     }
     setPendingOpponentDiscard(null);
     next = performDiscard(next, tile);
@@ -1225,7 +1334,21 @@ export function AIAssistant() {
     }
 
     appendLog(next, `${target.name} ${action} ${manualActionTile}（手动记录）`);
+    setPendingOpponentClaimPrompt(null);
     setGame(next);
+  };
+
+  const handleOpponentClaimSelect = (selection: { playerId: number; action: '碰' | '杠' } | null) => {
+    if (!game || !pendingOpponentClaimPrompt) return;
+    const pending = pendingOpponentClaimPrompt;
+    setPendingOpponentClaimPrompt(null);
+    if (!selection) {
+      const next = cloneGame(game);
+      resolveWaitPass(next);
+      setGame(next);
+      return;
+    }
+    setGame(applyClaimAction(game, selection.playerId, selection.action, pending.tile));
   };
 
   const askCurrentStrategy = async () => {
@@ -1270,9 +1393,15 @@ export function AIAssistant() {
   const right = activeGame.players[1];
   const canManualDiscard = setupPhase === '进行中' && !!game && game.currentPlayer === 0 && game.stage === '打牌' && !game.finished;
   const canManualDraw = setupPhase === '进行中' && !!game && game.currentPlayer === 0 && game.stage === '摸牌' && !game.finished && !myDrawPrompt;
+  const canManualOpenMagic = setupPhase === '进行中' && !!game && game.currentPlayer === 0 && game.stage === '打牌' && !game.finished && game.players[0].hand.includes(game.magicCard);
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
+      {drawHint && (
+        <div className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2 rounded-full border border-cyan-300 bg-cyan-50 px-3 py-1 text-xs font-medium text-cyan-800 shadow">
+          {drawHint}
+        </div>
+      )}
       <div className="border-b-4 border-blue-900 bg-gradient-to-r from-blue-700 via-cyan-700 to-teal-700 p-4 text-white">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -1304,6 +1433,8 @@ export function AIAssistant() {
             当前: {game.players[game.currentPlayer].name} · {game.stage}
           </Badge>
           <Badge variant="outline">动作 {game.actionCount}</Badge>
+          <Badge variant="outline">牌数校验 {tileLedger.total}/108</Badge>
+          <Badge variant="outline">财神剩余估计 {magicVisibleRemain}（翻开1张后）</Badge>
         </div>
       )}
 
@@ -1417,6 +1548,11 @@ export function AIAssistant() {
                     {canManualDraw && (
                       <Button size="sm" variant="secondary" onClick={() => { void advanceStep(); }}>
                         摸牌
+                      </Button>
+                    )}
+                    {canManualOpenMagic && (
+                      <Button size="sm" variant="outline" onClick={handleMyOpenMagic}>
+                        开财神
                       </Button>
                     )}
                     <Button size="sm" onClick={confirmMyDiscard} disabled={!canManualDiscard || !selectedMyDiscard}>
@@ -1693,6 +1829,38 @@ export function AIAssistant() {
               </div>
             );
           })()}
+        </DialogContent>
+      </Dialog>
+
+      {/* 对手接牌确认弹窗 */}
+      <Dialog open={Boolean(pendingOpponentClaimPrompt)} onOpenChange={() => {}}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>确认对手是否碰/杠</DialogTitle>
+          </DialogHeader>
+          {pendingOpponentClaimPrompt && (
+            <div className="space-y-3">
+              <div className="text-sm text-slate-600">
+                {game?.players[pendingOpponentClaimPrompt.by].name} 打出 <strong>{pendingOpponentClaimPrompt.tile}</strong> 后，是否有其他对手碰/杠？
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {pendingOpponentClaimPrompt.options.map((option, idx) => (
+                  <Button
+                    key={`${option.playerId}-${option.action}-${idx}`}
+                    size="sm"
+                    variant="outline"
+                    onClick={() => handleOpponentClaimSelect(option)}
+                  >
+                    {game?.players[option.playerId].name} {option.action}
+                  </Button>
+                ))}
+              </div>
+              <div className="flex items-center gap-2">
+                <Button onClick={() => handleOpponentClaimSelect(null)}>无人接牌</Button>
+                <span className="text-xs text-slate-500">未确认前不会自动进入下一阶段</span>
+              </div>
+            </div>
+          )}
         </DialogContent>
       </Dialog>
 

@@ -75,7 +75,7 @@ interface RealtimeGame {
 interface OpponentModel {
   name: OpponentName;
   tingProb: number;
-  dangerSuit: SuitCN;
+  dangerSuit: SuitCN | '未知';
 }
 
 interface StageMetrics {
@@ -87,6 +87,7 @@ interface StageMetrics {
   waitRisk: number;
   opponents: OpponentModel[];
   safeTiles: string[];
+  hasInsights: boolean;
   phaseInsights: {
     draw: string;
     discard: string;
@@ -412,6 +413,11 @@ function inferOpponents(game: RealtimeGame): OpponentModel[] {
     const p = game.players[i];
     const counts: Record<SuitCN, number> = { 万: 0, 筒: 0, 条: 0 };
     p.discards.forEach((tile) => { counts[suitOf(tile)] += 1; });
+    const exposure = p.discards.length + p.pengSets.length + p.gangSets.length + p.magicReveals.length;
+    if (exposure === 0) {
+      models.push({ name: p.name as OpponentName, tingProb: 0, dangerSuit: '未知' });
+      continue;
+    }
     const least = (Object.entries(counts) as Array<[SuitCN, number]>).sort((a, b) => a[1] - b[1])[0][0];
     const base = p.discards.length + p.pengSets.length * 2 + p.gangSets.length * 3;
     const tingProb = clamp((base - 2) / 12, 0.05, 0.92);
@@ -446,7 +452,10 @@ function buildVisibleTileCounts(game: RealtimeGame) {
 function discardRisk(tile: string, models: OpponentModel[]) {
   if (models.length === 0) return 0.25;
   const suit = suitOf(tile);
-  const r = models.reduce((sum, m) => sum + m.tingProb * (m.dangerSuit === suit ? 0.78 : 0.34), 0) / models.length;
+  const r = models.reduce((sum, m) => {
+    const suitWeight = m.dangerSuit === '未知' ? 0.45 : (m.dangerSuit === suit ? 0.78 : 0.34);
+    return sum + m.tingProb * suitWeight;
+  }, 0) / models.length;
   return clamp(r, 0.03, 0.95);
 }
 
@@ -474,6 +483,31 @@ function buildMetrics(game: RealtimeGame, analysis: LLMAnalysisResult | null): S
   const myHand = game.players[0].hand;
   const models = inferOpponents(game);
   const visible = buildVisibleTileCounts(game);
+  const hasInsights = game.tableDiscards.length > 0 || game.players.some((p, idx) => (
+    idx > 0 && (p.discards.length > 0 || p.pengSets.length > 0 || p.gangSets.length > 0 || p.magicReveals.length > 0)
+  ));
+
+  if (!hasInsights) {
+    const preferred = analysis?.recommendedDiscard && myHand.includes(analysis.recommendedDiscard)
+      ? analysis.recommendedDiscard
+      : '';
+    return {
+      drawProb: 0,
+      drawTargets: [],
+      discardRisk: 0,
+      safeRate: 0,
+      recommendedDiscard: preferred,
+      waitRisk: 0,
+      opponents: models,
+      safeTiles: [],
+      hasInsights: false,
+      phaseInsights: {
+        draw: '暂无公开信息，先完成摸牌。',
+        discard: preferred ? `可参考 ${preferred}，但当前信息不足。` : '暂无可靠推荐，先观察首轮弃牌。',
+        wait: '尚无听牌压力信号。'
+      }
+    };
+  }
 
   const unseenTotal = ALL_TILE_LABELS.reduce((sum, tile) => sum + clamp(4 - (visible[tile] ?? 0), 0, 4), 0);
   const base = handStructureScore(myHand);
@@ -520,6 +554,7 @@ function buildMetrics(game: RealtimeGame, analysis: LLMAnalysisResult | null): S
     waitRisk,
     opponents: models,
     safeTiles,
+    hasInsights: true,
     phaseInsights
   };
 }
@@ -585,6 +620,9 @@ function getActionGuideText(
   if (myDrawPrompt) {
     return '请选择你摸到的牌';
   }
+  if (game.currentPlayer === 0 && game.stage === '摸牌') {
+    return '点击“摸牌”后输入本次摸到的牌（每次仅一张）';
+  }
   if (pendingOpponentDiscard) {
     return `请输入你观察到的 ${game.players[pendingOpponentDiscard.playerId].name} 弃牌`;
   }
@@ -645,7 +683,9 @@ export function AIAssistant() {
     lastAction: '', lastDiscard: null, claimWindow: false, actionCount: 0, updatedAt: Date.now()
   };
 
-  const metrics = useMemo(() => buildMetrics(activeGame, analysis), [activeGame, analysis]);
+  const currentTurnKey = `${activeGame.turn}-${activeGame.currentPlayer}-${activeGame.stage}`;
+  const analysisForCurrentTurn = llmTurnKey === currentTurnKey ? analysis : null;
+  const metrics = useMemo(() => buildMetrics(activeGame, analysisForCurrentTurn), [activeGame, analysisForCurrentTurn]);
   const myPendingClaim = useMemo(() => getMyPendingClaim(activeGame), [activeGame]);
 
   // 暗杠/加杠检测
@@ -987,9 +1027,8 @@ export function AIAssistant() {
   useEffect(() => {
     if (setupPhase !== '进行中' || !game || game.finished) return;
     if (pendingOpponentDiscard || myPendingClaim || selfDrawHuPrompt || myDrawPrompt) return;
-    // 如果是玩家0的打牌阶段，不自动推进（等用户选牌）
-    // 注意：摸牌阶段需要调用 advanceStep 来弹出摸牌选择弹窗
-    if (game.currentPlayer === 0 && game.stage === '打牌') return;
+    // 玩家0的摸牌/打牌都由用户触发，避免自动连环推进
+    if (game.currentPlayer === 0 && (game.stage === '打牌' || game.stage === '摸牌')) return;
 
     const timer = setTimeout(() => {
       if (!isAdvancingRef.current && !isLLMRunning) {
@@ -1194,6 +1233,7 @@ export function AIAssistant() {
   const top = activeGame.players[2];
   const right = activeGame.players[1];
   const canManualDiscard = setupPhase === '进行中' && !!game && game.currentPlayer === 0 && game.stage === '打牌' && !game.finished;
+  const canManualDraw = setupPhase === '进行中' && !!game && game.currentPlayer === 0 && game.stage === '摸牌' && !game.finished && !myDrawPrompt;
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
@@ -1338,6 +1378,11 @@ export function AIAssistant() {
                   </div>
 
                   <div className="mt-2 flex flex-wrap items-center gap-2">
+                    {canManualDraw && (
+                      <Button size="sm" variant="secondary" onClick={() => { void advanceStep(); }}>
+                        摸牌
+                      </Button>
+                    )}
                     <Button size="sm" onClick={confirmMyDiscard} disabled={!canManualDiscard || !selectedMyDiscard}>
                       确认打出
                     </Button>
@@ -1396,7 +1441,7 @@ export function AIAssistant() {
 
               <div className="rounded bg-cyan-50 p-3">
                 <div className="font-medium">打牌阶段</div>
-                <div>推荐舍牌: <strong>{metrics.recommendedDiscard}</strong></div>
+                <div>推荐舍牌: <strong>{metrics.recommendedDiscard || '暂无'}</strong></div>
                 <div>预计安全率: <strong>{pct(metrics.safeRate)}</strong></div>
                 <Progress value={metrics.safeRate * 100} className="mt-2 h-2" />
               </div>
@@ -1421,13 +1466,13 @@ export function AIAssistant() {
               <CardTitle className="text-lg">当前执行策略</CardTitle>
             </CardHeader>
             <CardContent className="space-y-2 text-sm">
-              {!analysis && <p className="text-slate-500">进入"我的打牌阶段"后会自动尝试LLM策略推理。</p>}
-              {analysis && (
+              {!analysisForCurrentTurn && <p className="text-slate-500">进入"我的打牌阶段"后会自动尝试LLM策略推理。</p>}
+              {analysisForCurrentTurn && (
                 <>
-                  <div className="font-semibold">{analysis.strategyName}</div>
-                  <div className="rounded bg-emerald-50 p-2">{analysis.strategyExplanation}</div>
-                  <div>推荐舍牌: <strong>{analysis.recommendedDiscard}</strong> · 风险: <strong>{analysis.riskLevel}</strong></div>
-                  <div className="text-xs text-slate-600">{analysis.actionGuide}</div>
+                  <div className="font-semibold">{analysisForCurrentTurn.strategyName}</div>
+                  <div className="rounded bg-emerald-50 p-2">{analysisForCurrentTurn.strategyExplanation}</div>
+                  <div>推荐舍牌: <strong>{analysisForCurrentTurn.recommendedDiscard}</strong> · 风险: <strong>{analysisForCurrentTurn.riskLevel}</strong></div>
+                  <div className="text-xs text-slate-600">{analysisForCurrentTurn.actionGuide}</div>
                 </>
               )}
             </CardContent>
@@ -1472,7 +1517,9 @@ export function AIAssistant() {
             <CardContent className="space-y-2 text-sm text-slate-700">
               <div>优先打与对手危险花色不同的牌，优先熟张。</div>
               <div className="rounded bg-rose-50 p-2 text-xs">
-                听牌压力 {pct(metrics.waitRisk)}，建议优先 {metrics.safeTiles[0] ?? '安全张'}。
+                {metrics.hasInsights
+                  ? `听牌压力 ${pct(metrics.waitRisk)}，建议优先 ${metrics.safeTiles[0] ?? '安全张'}。`
+                  : '当前公开信息不足，先观察首轮弃牌后再做防点炮决策。'}
               </div>
             </CardContent>
           </Card>
@@ -1659,11 +1706,11 @@ export function AIAssistant() {
           <div className="grid max-h-[calc(85vh-56px)] grid-cols-1 md:grid-cols-[1fr_1.2fr]">
             <div className="border-r bg-slate-50 p-4">
               <div className="text-xs text-slate-500">实时策略</div>
-              <div className="mt-1 text-sm font-semibold">{analysis?.strategyName ?? '等待策略生成'}</div>
-              <p className="mt-2 text-sm text-slate-700">{analysis?.strategyExplanation ?? '进入我的打牌阶段后会自动触发策略分析。'}</p>
+              <div className="mt-1 text-sm font-semibold">{analysisForCurrentTurn?.strategyName ?? '等待策略生成'}</div>
+              <p className="mt-2 text-sm text-slate-700">{analysisForCurrentTurn?.strategyExplanation ?? '进入我的打牌阶段后会自动触发策略分析。'}</p>
               <div className="mt-3 rounded bg-white p-3 text-xs text-slate-600">
                 <div>阶段: {activeGame.stage}</div>
-                <div>推荐舍牌: {analysis?.recommendedDiscard ?? metrics.recommendedDiscard}</div>
+                <div>推荐舍牌: {(analysisForCurrentTurn?.recommendedDiscard ?? metrics.recommendedDiscard) || '暂无'}</div>
                 <div>点炮风险: {pct(metrics.discardRisk)}</div>
               </div>
             </div>

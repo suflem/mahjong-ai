@@ -1083,25 +1083,45 @@ export function AIAssistant() {
     if (!game || !myDrawPrompt || game.currentPlayer !== 0 || game.stage !== '摸牌') return;
     const next = cloneGame(game);
     const me = next.players[0];
-    
+
+    // 从牌墙中移除一张（保持牌墙计数准确）
+    const wallIdx = next.wall.indexOf(tile);
+    if (wallIdx >= 0) {
+      next.wall.splice(wallIdx, 1);
+    } else if (next.wall.length > 0) {
+      next.wall.pop();
+    }
+
     // 检查是否摸到财神
     if (tile === next.magicCard) {
       me.magicReveals.push(tile);
       appendLog(next, `我 开财神 ${tile}`);
+
+      // 牌墙为空则流局
+      if (next.wall.length === 0) {
+        next.finished = true;
+        next.winner = null;
+        appendLog(next, '牌墙为空，流局。');
+        setGame(next);
+        setMyDrawPrompt(null);
+        setSelectedDrawTile('');
+        return;
+      }
+
       // 开财神后继续摸牌，重新计算可用牌并更新弹窗
       const visible = buildVisibleTileCounts(next);
       const availableTiles = ALL_TILE_LABELS.filter((t) => {
         const remain = clamp(4 - (visible[t] ?? 0), 0, 4);
         return remain > 0;
       }).sort((a, b) => tileSortValue(a) - tileSortValue(b));
-      
+
       setGame(next);
       setSelectedDrawTile('');
       // 直接更新弹窗内容而不是关闭
       setMyDrawPrompt({ availableTiles });
       return;
     }
-    
+
     me.hand = sortHand([...me.hand, tile]);
     me.handCount = me.hand.length;
     appendLog(next, `我 摸牌 ${tile}`);
@@ -1546,8 +1566,8 @@ export function AIAssistant() {
         </DialogContent>
       </Dialog>
 
-      {/* 玩家摸牌输入弹窗 */}
-      <Dialog open={Boolean(myDrawPrompt)} onOpenChange={(open) => { if (!open) setMyDrawPrompt(null); }}>
+      {/* 玩家摸牌输入弹窗 — 不允许手动关闭，必须选牌确认 */}
+      <Dialog open={Boolean(myDrawPrompt)} onOpenChange={() => {}}>
         <DialogContent className="max-w-xl max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>请输入你摸到的牌</DialogTitle>

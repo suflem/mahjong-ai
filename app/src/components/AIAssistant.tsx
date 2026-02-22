@@ -979,14 +979,15 @@ export function AIAssistant() {
     } finally {
       isAdvancingRef.current = false;
     }
-  }, [game, isLLMRunning, pendingOpponentDiscard, myPendingClaim, selfDrawHuPrompt, config.apiKey, performDiscard, runStrategyForCurrentTurn]);
+  }, [game, isLLMRunning, pendingOpponentDiscard, myPendingClaim, selfDrawHuPrompt, myDrawPrompt, config.apiKey, performDiscard, runStrategyForCurrentTurn]);
 
   // 自动推进 useEffect
   useEffect(() => {
     if (setupPhase !== '进行中' || !game || game.finished) return;
     if (pendingOpponentDiscard || myPendingClaim || selfDrawHuPrompt || myDrawPrompt) return;
-    // 如果是玩家0的摸牌阶段或打牌阶段，不自动推进（等用户输入/选牌）
-    if (game.currentPlayer === 0 && (game.stage === '摸牌' || game.stage === '打牌')) return;
+    // 如果是玩家0的打牌阶段，不自动推进（等用户选牌）
+    // 注意：摸牌阶段需要调用 advanceStep 来弹出摸牌选择弹窗
+    if (game.currentPlayer === 0 && game.stage === '打牌') return;
 
     const timer = setTimeout(() => {
       if (!isAdvancingRef.current && !isLLMRunning) {
@@ -994,7 +995,7 @@ export function AIAssistant() {
       }
     }, 600);
     return () => clearTimeout(timer);
-  }, [setupPhase, game, pendingOpponentDiscard, myPendingClaim, selfDrawHuPrompt, isLLMRunning, advanceStep]);
+  }, [setupPhase, game, pendingOpponentDiscard, myPendingClaim, selfDrawHuPrompt, myDrawPrompt, isLLMRunning, advanceStep]);
 
   // 自动触发LLM策略
   useEffect(() => {

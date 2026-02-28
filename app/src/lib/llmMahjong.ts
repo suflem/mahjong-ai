@@ -101,7 +101,13 @@ const SYSTEM_PROMPT = `你是山东麻将策略引擎，只输出JSON。
 - 熟张: 已在弃牌区出现过的牌，被碰/杠的概率低。
 - 对手刚打过的牌: 短期内安全(除非其他家听该牌)。
 - 对手不要的花色: 某家大量弃某花色，说明该花色对该家较安全。
+- 筋线(Suji): 对手弃4/5/6时，同花色1-7/2-8/3-9可视为相对安全。
+- 壁牌(Kabe): 某关键连接牌已见4张时，对应边张形成No Chance（仅针对两面听）。
+- One Chance: 关键连接牌仅剩1张时，对应牌两面听风险显著下降。
+- 间筋(Nakasuji): 同一对手若已打出1和7/2和8/3和9，则中间4/5/6相对安全。
+- 早外(Early Outside): 对手若前3巡就打出4/5/6，则该花色1/2/8/9相对更安全。
 - 危险牌: 对手弃牌中缺少某花色，说明可能在做该花色，打该花色危险。
+- 注意: 筋线/间筋/壁牌主要防两面听，不能覆盖坎张/边张/单钓，后期仍需保留风险余量。
 
 ### 碰/杠时机
 - 碰: 能直接降低向听数时碰；纯粹凑刻子但破坏顺子搭子时不碰。
@@ -136,6 +142,8 @@ const SYSTEM_PROMPT = `你是山东麻将策略引擎，只输出JSON。
   “rule_checks”: [“向听数变化”,”安全性检查”,”路线一致性”],
   “chat_reply”: “对用户的直接回复”
 }`;
+
+const MAX_HISTORY_MESSAGES_IN_PROMPT = 6; // 最近3轮(用户+助手)
 
 function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length * 1.15));
@@ -235,7 +243,7 @@ function buildUserPrompt(context: MahjongContext, userMessage: string, history: 
     `=== 公共弃牌区(最近) ===`,
     context.tableDiscards.slice(-20).join(' ') || '无',
     ``,
-    history.length > 0 ? `=== 最近对话 ===\n${history.slice(-4).map((m) => `${m.role}: ${m.content}`).join('\n')}` : '',
+    history.length > 0 ? `=== 最近对话 ===\n${history.slice(-MAX_HISTORY_MESSAGES_IN_PROMPT).map((m) => `${m.role}: ${m.content}`).join('\n')}` : '',
     `=== 用户请求 ===`,
     userMessage
   ].filter(Boolean).join('\n');

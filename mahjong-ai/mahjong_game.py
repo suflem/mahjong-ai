@@ -81,7 +81,9 @@ class Card:
 class ShandongMahjong:
     """山东麻将游戏引擎"""
     
-    def __init__(self):
+    def __init__(self, include_honors: bool = False):
+        self.include_honors = include_honors
+        self.tile_kind_count = 34 if include_honors else 27
         self.cards: List[Card] = []
         self.magic_card: Optional[Card] = None  # 财神牌
         self.wall: List[Card] = []  # 牌墙
@@ -89,21 +91,22 @@ class ShandongMahjong:
         self._init_cards()
     
     def _init_cards(self):
-        """初始化136张牌"""
+        """初始化牌池（108或136张）"""
         self.cards = []
         # 万、筒、条各36张
         for card_type in [CardType.WAN, CardType.TONG, CardType.TIAO]:
             for value in range(1, 10):
                 for _ in range(4):
                     self.cards.append(Card(card_type, value))
-        # 风牌16张
-        for value in range(1, 5):
-            for _ in range(4):
-                self.cards.append(Card(CardType.FENG, value))
-        # 箭牌12张
-        for value in range(1, 4):
-            for _ in range(4):
-                self.cards.append(Card(CardType.JIAN, value))
+        if self.include_honors:
+            # 风牌16张
+            for value in range(1, 5):
+                for _ in range(4):
+                    self.cards.append(Card(CardType.FENG, value))
+            # 箭牌12张
+            for value in range(1, 4):
+                for _ in range(4):
+                    self.cards.append(Card(CardType.JIAN, value))
     
     def shuffle_and_deal(self) -> Tuple[List[List[Card]], Card]:
         """洗牌并发牌，返回4家手牌和财神牌"""
@@ -229,7 +232,7 @@ class ShandongMahjong:
         小胡必须258做将，大胡任意将都可以
         """
         # 尝试每种牌作为将牌
-        for jiang_index in range(34):
+        for jiang_index in range(self.tile_kind_count):
             jiang_card = Card.from_index(jiang_index)
             
             # 小胡必须258做将（万筒条）
@@ -262,7 +265,7 @@ class ShandongMahjong:
             return sum(card_counts.values()) <= magic_count
         
         # 找到第一个有牌的索引
-        for i in range(34):
+        for i in range(self.tile_kind_count):
             if card_counts[i] > 0:
                 # 尝试组成刻子
                 if card_counts[i] >= 3:
@@ -330,7 +333,7 @@ class ShandongMahjong:
         ting_cards = set()
         
         # 遍历所有可能的牌
-        for i in range(34):
+        for i in range(self.tile_kind_count):
             test_card = Card.from_index(i)
             test_hand = hand + [test_card]
             can_hu, info = self.can_hu(test_hand, magic_count)
@@ -385,7 +388,8 @@ class MahjongAI:
         self.other_players_gang: Dict[int, List[List[Card]]] = {i: [] for i in range(4) if i != player_id}
         
         # 牌墙估计
-        self.estimated_wall: Dict[int, int] = {i: 4 for i in range(34)}  # 每张牌剩余数量估计
+        # 默认按108张模型估计，init_hand后会按具体规则重建
+        self.estimated_wall: Dict[int, int] = {i: 4 for i in range(27)}  # 每张牌剩余数量估计
     
     def init_hand(self, hand: List[Card], game: ShandongMahjong):
         """初始化手牌"""
@@ -396,8 +400,9 @@ class MahjongAI:
     
     def _update_estimated_wall(self):
         """更新牌墙估计"""
+        tile_kind_count = self.game.tile_kind_count if self.game else 27
         # 初始每张牌4张
-        self.estimated_wall = {i: 4 for i in range(34)}
+        self.estimated_wall = {i: 4 for i in range(tile_kind_count)}
         
         # 减去自己手中的牌
         for card in self.hand:

@@ -4,7 +4,7 @@
 """
 
 import random
-from typing import List, Dict, Tuple, Set, Optional
+from typing import List, Dict, Tuple, Set, Optional, Any
 from collections import Counter
 from enum import Enum
 import copy
@@ -120,7 +120,9 @@ class ShandongMahjong:
     支持规则：开神、四扑一将、清七、开杠、明杠、暗杠、加杠、抢杠胡
     """
     
-    def __init__(self):
+    def __init__(self, include_honors: bool = False):
+        self.include_honors = include_honors
+        self.tile_kind_count = 34 if include_honors else 27
         self.cards: List[Card] = []
         self.magic_card: Optional[Card] = None  # 财神牌
         self.wall: List[Card] = []  # 牌墙
@@ -129,21 +131,22 @@ class ShandongMahjong:
         self._init_cards()
     
     def _init_cards(self):
-        """初始化136张牌"""
+        """初始化牌池（108或136张）"""
         self.cards = []
         # 万、筒、条各36张
         for card_type in [CardType.WAN, CardType.TONG, CardType.TIAO]:
             for value in range(1, 10):
                 for _ in range(4):
                     self.cards.append(Card(card_type, value))
-        # 风牌16张
-        for value in range(1, 5):
-            for _ in range(4):
-                self.cards.append(Card(CardType.FENG, value))
-        # 箭牌12张
-        for value in range(1, 4):
-            for _ in range(4):
-                self.cards.append(Card(CardType.JIAN, value))
+        if self.include_honors:
+            # 风牌16张
+            for value in range(1, 5):
+                for _ in range(4):
+                    self.cards.append(Card(CardType.FENG, value))
+            # 箭牌12张
+            for value in range(1, 4):
+                for _ in range(4):
+                    self.cards.append(Card(CardType.JIAN, value))
     
     def shuffle_and_deal(self) -> Tuple[List[List[Card]], Card]:
         """洗牌并发牌，返回4家手牌和财神牌"""
@@ -300,7 +303,7 @@ class ShandongMahjong:
         小胡必须258做将，大胡任意将都可以
         """
         # 尝试每种牌作为将牌
-        for jiang_index in range(34):
+        for jiang_index in range(self.tile_kind_count):
             jiang_card = Card.from_index(jiang_index)
             
             # 小胡必须258做将（万筒条）
@@ -333,7 +336,7 @@ class ShandongMahjong:
             return sum(card_counts.values()) <= magic_count
         
         # 找到第一个有牌的索引
-        for i in range(34):
+        for i in range(self.tile_kind_count):
             if card_counts[i] > 0:
                 # 尝试组成刻子
                 if card_counts[i] >= 3:
@@ -397,7 +400,7 @@ class ShandongMahjong:
         """获取听牌列表"""
         ting_cards = set()
         
-        for i in range(34):
+        for i in range(self.tile_kind_count):
             test_card = Card.from_index(i)
             test_hand = hand + [test_card]
             can_hu, info = self.can_hu(test_hand, magic_count)
@@ -577,18 +580,21 @@ class MahjongAssistant:
             return None
         
         card_scores = []
+        visible_counts = self._build_visible_counts()
         
         for card in self.hand:
+            features = self._build_defense_features(card, visible_counts)
             if self.magic_card and card == self.magic_card:
                 # 财神永远不打
                 score = -1000
             else:
-                score = self._evaluate_card(card)
+                score = self._evaluate_card(card, visible_counts)
             
             card_scores.append({
                 "card": card,
                 "score": score,
-                "reason": self._get_card_reason(card, score)
+                "reason": self._get_card_reason(card, score),
+                "features": features
             })
         
         # 按分数排序（分数越低越应该打）
@@ -600,8 +606,8 @@ class MahjongAssistant:
             "strategy": self._get_discard_strategy()
         }
     
-    def _evaluate_card(self, card: Card) -> float:
-        """评估一张牌的价值"""
+    def _evaluate_card_with_visible(self, card: Card, visible_counts: Optional[Dict[int, int]]) -> float:
+        """评估一张牌的价值（可复用可见牌计数）"""
         score = 0.0
         
         # 1. 孤张评估
@@ -617,7 +623,7 @@ class MahjongAssistant:
             score -= 15
         
         # 4. 危险度
-        danger = self._assess_card_danger(card)
+        danger = self._assess_card_danger(card, visible_counts)
         score += danger * 12
         
         # 5. 进张概率
@@ -625,6 +631,10 @@ class MahjongAssistant:
         score -= improvement * 20
         
         return score
+
+    def _evaluate_card(self, card: Card, visible_counts: Optional[Dict[int, int]] = None) -> float:
+        """评估一张牌的价值"""
+        return self._evaluate_card_with_visible(card, visible_counts)
     
     def _calculate_isolation(self, card: Card) -> float:
         """计算牌的孤立程度"""
@@ -670,16 +680,165 @@ class MahjongAssistant:
                     potential += 1.0
         
         return potential
+
+    def _is_number_card(self, card: Card) -> bool:
+        return card.type in [CardType.WAN, CardType.TONG, CardType.TIAO]
+
+    def _build_visible_counts(self) -> Dict[int, int]:
+        """构建可见牌计数（用于壁牌/One Chance估计）"""
+        counts = {i: 0 for i in range(self.game.tile_kind_count)}
+
+        def add_card(c: Card):
+            idx = c.to_index()
+            if idx < self.game.tile_kind_count:
+                counts[idx] += 1
+
+        for card in self.hand:
+            add_card(card)
+        for discards in self.discard_history.values():
+            for card in discards:
+                add_card(card)
+        for pengs in self.peng_history.values():
+            for group in pengs:
+                for card in group:
+                    add_card(card)
+        for gangs in self.gang_history.values():
+            for group in gangs:
+                for card in group:
+                    add_card(card)
+
+        return counts
+
+    def _remaining_count(self, card: Card, visible_counts: Dict[int, int]) -> int:
+        idx = card.to_index()
+        if idx >= self.game.tile_kind_count:
+            return 0
+        return max(0, 4 - visible_counts.get(idx, 0))
+
+    def _ryanmen_potential(self, card: Card, visible_counts: Dict[int, int]) -> int:
+        """估计该牌作为两面听放铳目标的潜在组合强度"""
+        if not self._is_number_card(card):
+            return 0
+
+        potential = 0
+        value = card.value
+        for left, right in [(value - 2, value - 1), (value + 1, value + 2)]:
+            if 1 <= left <= 9 and 1 <= right <= 9:
+                c_left = Card(card.type, left)
+                c_right = Card(card.type, right)
+                potential += self._remaining_count(c_left, visible_counts) * self._remaining_count(c_right, visible_counts)
+        return potential
+
+    def _kabe_class(self, card: Card, visible_counts: Dict[int, int]) -> str:
+        """壁牌分类: no_chance / one_chance / normal"""
+        potential = self._ryanmen_potential(card, visible_counts)
+        if potential <= 0:
+            return "no_chance"
+        if potential <= 4:
+            return "one_chance"
+        return "normal"
+
+    def _suji_middle_value(self, value: int) -> Optional[int]:
+        if value in [1, 7]:
+            return 4
+        if value in [2, 8]:
+            return 5
+        if value in [3, 9]:
+            return 6
+        return None
+
+    def _suji_support_count(self, card: Card) -> int:
+        if not self._is_number_card(card):
+            return 0
+        middle = self._suji_middle_value(card.value)
+        if middle is None:
+            return 0
+        middle_card = Card(card.type, middle)
+        return sum(1 for pid in range(1, 4) if any(c == middle_card for c in self.discard_history[pid]))
+
+    def _nakasuji_support_count(self, card: Card) -> int:
+        if not self._is_number_card(card):
+            return 0
+        if card.value < 4 or card.value > 6:
+            return 0
+        left = Card(card.type, card.value - 3)
+        right = Card(card.type, card.value + 3)
+        return sum(
+            1 for pid in range(1, 4)
+            if any(c == left for c in self.discard_history[pid]) and any(c == right for c in self.discard_history[pid])
+        )
+
+    def _early_middle_discard_turn(self, player_id: int, card_type: CardType) -> Optional[int]:
+        discards = self.discard_history[player_id]
+        for idx, card in enumerate(discards):
+            if card.type == card_type and 4 <= card.value <= 6:
+                return idx + 1
+        return None
+
+    def _early_outside_support_count(self, card: Card) -> int:
+        if not self._is_number_card(card):
+            return 0
+        if card.value not in [1, 2, 8, 9]:
+            return 0
+        count = 0
+        for pid in range(1, 4):
+            turn = self._early_middle_discard_turn(pid, card.type)
+            if turn is not None and turn <= 3:
+                count += 1
+        return count
+
+    def _build_defense_features(self, card: Card, visible_counts: Optional[Dict[int, int]] = None) -> Dict[str, Any]:
+        """提取后端训练特征（Suji/Kabe/Nakasuji/早外）"""
+        if visible_counts is None:
+            visible_counts = self._build_visible_counts()
+
+        idx = card.to_index()
+        seen_count = visible_counts.get(idx, 0) if idx < self.game.tile_kind_count else 0
+        features: Dict[str, Any] = {
+            "tile": str(card),
+            "seen_count": seen_count,
+            "is_number_tile": self._is_number_card(card),
+            "suji_support": 0,
+            "nakasuji_support": 0,
+            "early_outside_support": 0,
+            "ryanmen_potential": 0,
+            "kabe_class": "normal",
+            "no_chance": False,
+            "one_chance": False
+        }
+
+        if not self._is_number_card(card):
+            return features
+
+        suji_support = self._suji_support_count(card)
+        nakasuji_support = self._nakasuji_support_count(card)
+        early_outside_support = self._early_outside_support_count(card)
+        ryanmen_potential = self._ryanmen_potential(card, visible_counts)
+        kabe_class = self._kabe_class(card, visible_counts)
+
+        features.update({
+            "suji_support": suji_support,
+            "nakasuji_support": nakasuji_support,
+            "early_outside_support": early_outside_support,
+            "ryanmen_potential": ryanmen_potential,
+            "kabe_class": kabe_class,
+            "no_chance": kabe_class == "no_chance",
+            "one_chance": kabe_class == "one_chance"
+        })
+        return features
     
-    def _assess_card_danger(self, card: Card) -> float:
-        """评估打出某张牌的危险程度"""
+    def _assess_card_danger(self, card: Card, visible_counts: Optional[Dict[int, int]] = None) -> float:
+        """评估打出某张牌的危险程度（含Suji/Kabe/Nakasuji/早外特征）"""
+        if visible_counts is None:
+            visible_counts = self._build_visible_counts()
+
         danger = 0.0
-        
-        # 统计已出现的牌
-        all_discards = []
+
+        # 统计已出现的牌（偏防守视角）
+        all_discards: List[Card] = []
         for discards in self.discard_history.values():
             all_discards.extend(discards)
-        
+
         seen_count = sum(1 for c in all_discards if c == card)
         
         if seen_count == 0:
@@ -690,11 +849,27 @@ class MahjongAssistant:
             danger -= 2.0
         
         # 中张危险度高
-        if card.type in [CardType.WAN, CardType.TONG, CardType.TIAO]:
+        if self._is_number_card(card):
             if 3 <= card.value <= 7:
                 danger += 2.0
-        
-        return danger
+
+        # 特征工程修正：筋线 + 间筋 + 早外 + 壁牌
+        features = self._build_defense_features(card, visible_counts)
+        if features["is_number_tile"]:
+            danger -= 0.55 * features["suji_support"]
+            danger -= 0.75 * features["nakasuji_support"]
+            danger -= 0.45 * features["early_outside_support"]
+
+            if features["kabe_class"] == "no_chance":
+                danger -= 2.2
+            elif features["kabe_class"] == "one_chance":
+                danger -= 1.0
+
+            # 防止过度自信：这些特征主要覆盖两面听
+            if features["suji_support"] > 0 or features["nakasuji_support"] > 0 or features["kabe_class"] != "normal":
+                danger += 0.25
+
+        return max(-3.5, min(6.0, danger))
     
     def _calculate_improvement(self, card: Card) -> float:
         """计算保留这张牌的进张概率"""
@@ -704,7 +879,7 @@ class MahjongAssistant:
         if not ting_cards:
             return 0.0
         
-        return len(ting_cards) / 34.0
+        return len(ting_cards) / float(self.game.tile_kind_count)
     
     def _get_card_reason(self, card: Card, score: float) -> str:
         """获取出牌原因说明"""
@@ -745,7 +920,8 @@ class MahjongAssistant:
         for card in ting_cards:
             seen = sum(1 for c in all_discards if c == card)
             remaining = 4 - seen
-            prob = remaining / max(1, 68 - len(all_discards))
+            unseen_baseline = len(self.game.cards) // 2
+            prob = remaining / max(1, unseen_baseline - len(all_discards))
             
             ting_analysis.append({
                 "card": card,

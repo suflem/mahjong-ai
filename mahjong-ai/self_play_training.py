@@ -15,7 +15,8 @@ class SelfPlayGame:
     
     def __init__(self, game_id: str):
         self.game_id = game_id
-        self.game = ShandongMahjong()
+        # 与前端一致：默认使用108张（仅万/筒/条）
+        self.game = ShandongMahjong(include_honors=False)
         self.players = []
         self.actions = []
         self.start_time = datetime.now().isoformat()
@@ -69,7 +70,19 @@ class SelfPlayGame:
             
             # AI决策
             recommendation = player['ai'].get_recommendation()
-            discard = recommendation['discard_recommendation']['recommended']['card'] if recommendation['discard_recommendation'] else player['hand'][0]
+            discard_block = recommendation['discard_recommendation'] if recommendation else None
+            selected = discard_block['recommended'] if discard_block and discard_block.get('recommended') else None
+            discard = selected['card'] if selected else player['hand'][0]
+
+            candidate_top3 = []
+            if discard_block:
+                for item in discard_block.get('all_scores', [])[:3]:
+                    candidate_top3.append({
+                        'card': str(item.get('card')),
+                        'score': float(item.get('score', 0.0)),
+                        'reason': str(item.get('reason', '')),
+                        'features': item.get('features', {})
+                    })
             
             # 记录动作
             action = {
@@ -80,8 +93,10 @@ class SelfPlayGame:
                 'state_before': state_before,
                 'ai_decision': {
                     'recommended': str(discard),
-                    'reason': recommendation['discard_recommendation']['recommended']['reason'] if recommendation['discard_recommendation'] else '',
-                    'xiang_ting': recommendation['current_status']['xiang_ting'] if recommendation else 0
+                    'reason': selected['reason'] if selected else '',
+                    'xiang_ting': recommendation['current_status']['xiang_ting'] if recommendation else 0,
+                    'defense_features': selected.get('features', {}) if selected else {},
+                    'candidate_top3': candidate_top3
                 }
             }
             self.actions.append(action)
@@ -90,6 +105,8 @@ class SelfPlayGame:
             player['hand'].remove(discard)
             player['discarded'].append(discard)
             self.game.discarded.append(discard)
+            for p in self.players:
+                p['ai'].record_discard(current_player, discard)
             
             # 检查其他玩家是否可以胡
             for i, p in enumerate(self.players):

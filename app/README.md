@@ -1,73 +1,71 @@
-# React + TypeScript + Vite
+# 山东麻将 AI 助手前端
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+`app/` 是本项目的前端交互模块，提供新手训练、互动牌局与 LLM 策略解释界面。
 
-Currently, two official plugins are available:
+## 在线版本
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- Demo: `https://<your-vercel-domain>.vercel.app`
+- 本项目在 Vercel 上部署时，Root Directory 需设置为 `app`
 
-## React Compiler
+## 主要功能
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+1. 新手训练（10 课）
+- 规则讲解 + 互动练习（对子、顺子、碰杠、胡牌形态、防守）
 
-## Expanding the ESLint configuration
+2. 互动牌局
+- 三阶段流程：摸牌 -> 打牌 -> 等待
+- 支持录入财神、手牌、庄家顺序、对手弃牌与碰杠行为
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+3. 策略分析面板
+- 阶段概率与风险提示
+- 推荐舍牌、动作建议（碰/杠/防守）
+- 实时动作日志
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+4. LLM 对话与解释
+- 对接 OpenAI 风格接口
+- 使用系统提示词约束输出为结构化 JSON，减少跑题
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+## 技术栈
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+- React 19 + TypeScript
+- Vite 7
+- Tailwind CSS + shadcn/ui
+- Lucide Icons
+
+## 本地启动
+
+```powershell
+cd "S:\山东麻将AI设计\app"
+npm install
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## 构建与预览
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```powershell
+cd "S:\山东麻将AI设计\app"
+npm run build
+npm run preview
 ```
+
+## Vercel 部署参数
+
+- Framework Preset: `Vite`
+- Root Directory: `app`
+- Install Command: `npm install`
+- Build Command: `npm run build`
+- Output Directory: `dist`
+
+## LLM 使用说明
+
+- 在页面的 LLM 设置中填写：
+- `API Key`
+- `Base URL`（默认 `https://api.openai.com/v1`）
+- `Model`（默认 `gpt-4.1-mini`）
+
+项目会调用 `chat/completions` 并解析 JSON 结构结果。
+
+## 说明
+
+- 当前默认规则是简化山东麻将（万/筒/条 + 财神）
+- 部分状态由用户手工输入，适合教学演示和策略讨论，不是全自动裁判系统

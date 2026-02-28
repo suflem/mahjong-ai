@@ -131,6 +131,19 @@ const defaultConfig: LLMConfig = {
 };
 
 const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(min, v));
+const MAX_LOG_ENTRIES = 36;
+const MAX_LLM_HISTORY_MESSAGES = 6; // 最近3轮(用户+助手)
+const MAX_UI_HISTORY_MESSAGES = 24;
+const TOTAL_TILE_COUNT = ALL_TILE_LABELS.length * 4;
+
+function trimHistory(history: ChatMessage[], maxMessages: number): ChatMessage[] {
+  if (history.length <= maxMessages) return history;
+  return history.slice(-maxMessages);
+}
+
+function pushHistory(history: ChatMessage[], nextMessage: ChatMessage, maxMessages: number): ChatMessage[] {
+  return trimHistory([...history, nextMessage], maxMessages);
+}
 
 function shuffle<T>(arr: T[]) {
   const copy = [...arr];
@@ -433,6 +446,11 @@ function handStructureScore(hand: string[]) {
 }
 
 function inferOpponents(game: RealtimeGame): OpponentModel[] {
+  const isSafeDiscard = (tile: string) => {
+    const n = numberOf(tile);
+    return n === 1 || n === 9;
+  };
+
   const models: OpponentModel[] = [];
   for (let i = 1; i <= 3; i += 1) {
     const p = game.players[i];
@@ -443,10 +461,43 @@ function inferOpponents(game: RealtimeGame): OpponentModel[] {
       models.push({ name: p.name as OpponentName, tingProb: 0, dangerSuit: '未知' });
       continue;
     }
-    const least = (Object.entries(counts) as Array<[SuitCN, number]>).sort((a, b) => a[1] - b[1])[0][0];
-    const base = p.discards.length + p.pengSets.length * 2 + p.gangSets.length * 3;
-    const tingProb = clamp((base - 2) / 12, 0.05, 0.92);
-    models.push({ name: p.name as OpponentName, tingProb, dangerSuit: least });
+
+    const sortedSuits = (Object.entries(counts) as Array<[SuitCN, number]>).sort((a, b) => a[1] - b[1]);
+    const dangerSuit = sortedSuits[0][1] === sortedSuits[2][1] ? '未知' : sortedSuits[0][0];
+
+    const recent = p.discards.slice(-5);
+    const safeCount = recent.filter(isSafeDiscard).length;
+    let safeStreak = 0;
+    for (let idx = recent.length - 1; idx >= 0; idx -= 1) {
+      if (!isSafeDiscard(recent[idx])) break;
+      safeStreak += 1;
+    }
+
+    const prior = clamp((p.discards.length - 1) / 24, 0.04, 0.45);
+    let odds = prior / (1 - prior);
+
+    if (safeCount >= 4) odds *= 2.2;
+    else if (safeCount === 3) odds *= 1.45;
+    else if (safeCount <= 1) odds *= 0.85;
+
+    if (safeStreak >= 3) odds *= 1.35;
+
+    const aggression = clamp(
+      0.5 + p.pengSets.length * 0.12 + p.gangSets.length * 0.2 + p.magicReveals.length * 0.06,
+      0.25,
+      0.98
+    );
+    odds *= aggression;
+
+    if (game.wall.length < 30) odds *= 1.25;
+    else if (game.wall.length < 55) odds *= 1.1;
+
+    if (p.pengSets.length === 0 && p.gangSets.length === 0 && p.discards.length < 5) {
+      odds *= 0.75;
+    }
+
+    const tingProb = clamp(odds / (1 + odds), 0.03, 0.95);
+    models.push({ name: p.name as OpponentName, tingProb, dangerSuit });
   }
   return models;
 }
@@ -474,23 +525,151 @@ function buildVisibleTileCounts(game: RealtimeGame) {
   return visible;
 }
 
-function discardRisk(tile: string, models: OpponentModel[]) {
-  if (models.length === 0) return 0.25;
-  const suit = suitOf(tile);
-  const r = models.reduce((sum, m) => {
-    const suitWeight = m.dangerSuit === '未知' ? 0.45 : (m.dangerSuit === suit ? 0.78 : 0.34);
-    return sum + m.tingProb * suitWeight;
-  }, 0) / models.length;
-  return clamp(r, 0.03, 0.95);
+function tileBySuitAndValue(suit: SuitCN, value: number) {
+  return `${value}${suit}`;
 }
 
-function chooseHeuristicDiscard(hand: string[], models: OpponentModel[]) {
+function remainingOf(tile: string, visible: Record<string, number>) {
+  return clamp(4 - (visible[tile] ?? 0), 0, 4);
+}
+
+function sujiMiddleNumber(tile: string): number | null {
+  const n = numberOf(tile);
+  if (n === 1 || n === 7) return 4;
+  if (n === 2 || n === 8) return 5;
+  if (n === 3 || n === 9) return 6;
+  return null;
+}
+
+function sujiProtectedByPlayer(tile: string, player: PlayerState): boolean {
+  const middle = sujiMiddleNumber(tile);
+  if (middle === null) return false;
+  const middleTile = tileBySuitAndValue(suitOf(tile), middle);
+  return player.discards.includes(middleTile);
+}
+
+function sujiProtectionCount(tile: string, game: RealtimeGame): number {
+  let protectedBy = 0;
+  for (let pid = 1; pid <= 3; pid += 1) {
+    if (sujiProtectedByPlayer(tile, game.players[pid])) protectedBy += 1;
+  }
+  return protectedBy;
+}
+
+function isNakasujiProtectedByPlayer(tile: string, player: PlayerState): boolean {
+  const n = numberOf(tile);
+  if (n < 4 || n > 6) return false;
+  const suit = suitOf(tile);
+  const leftEdge = n - 3;
+  const rightEdge = n + 3;
+  const leftTile = tileBySuitAndValue(suit, leftEdge);
+  const rightTile = tileBySuitAndValue(suit, rightEdge);
+  return player.discards.includes(leftTile) && player.discards.includes(rightTile);
+}
+
+function earlyMiddleDiscardTurn(player: PlayerState, suit: SuitCN): number | null {
+  for (let i = 0; i < player.discards.length; i += 1) {
+    const tile = player.discards[i];
+    if (suitOf(tile) !== suit) continue;
+    const n = numberOf(tile);
+    if (n >= 4 && n <= 6) return i + 1; // 以该玩家自身弃牌序号计巡目
+  }
+  return null;
+}
+
+function earlyOutsideFactor(turn: number | null): number {
+  if (turn === null || turn > 3) return 1;
+  if (turn === 1) return 0.72;
+  if (turn === 2) return 0.79;
+  return 0.86;
+}
+
+function ryanmenPotential(tile: string, visible: Record<string, number>): number {
+  const suit = suitOf(tile);
+  const n = numberOf(tile);
+  const pairs: Array<[number, number]> = [];
+  if (n - 2 >= 1) pairs.push([n - 2, n - 1]);
+  if (n + 2 <= 9) pairs.push([n + 1, n + 2]);
+
+  return pairs.reduce((sum, [a, b]) => {
+    const ra = remainingOf(tileBySuitAndValue(suit, a), visible);
+    const rb = remainingOf(tileBySuitAndValue(suit, b), visible);
+    return sum + ra * rb;
+  }, 0);
+}
+
+type KabeClass = 'no_chance' | 'one_chance' | 'normal';
+function classifyKabe(tile: string, visible: Record<string, number>): KabeClass {
+  const potential = ryanmenPotential(tile, visible);
+  if (potential <= 0) return 'no_chance';
+  if (potential <= 4) return 'one_chance';
+  return 'normal';
+}
+
+function kabeFactor(kabeClass: KabeClass): number {
+  if (kabeClass === 'no_chance') return 0.5;
+  if (kabeClass === 'one_chance') return 0.74;
+  return 1;
+}
+
+function kabeLabel(kabeClass: KabeClass): string {
+  if (kabeClass === 'no_chance') return 'No Chance';
+  if (kabeClass === 'one_chance') return 'One Chance';
+  return 'Normal';
+}
+
+function discardRisk(tile: string, models: OpponentModel[], game: RealtimeGame, visible: Record<string, number>) {
+  if (models.length === 0) return 0.25;
+  const suit = suitOf(tile);
+  const n = numberOf(tile);
+
+  const playerByName: Record<OpponentName, PlayerState> = {
+    下家: game.players[1],
+    对家: game.players[2],
+    上家: game.players[3]
+  };
+
+  const perOpponent = models.reduce((sum, m) => {
+    const p = playerByName[m.name];
+    const suitWeight = m.dangerSuit === '未知' ? 0.45 : (m.dangerSuit === suit ? 0.78 : 0.34);
+    let localRisk = m.tingProb * suitWeight;
+    let localFactor = 1;
+
+    // 1) 筋线: 对应中张已被该对手打出，降低两面听风险
+    if (p && sujiProtectedByPlayer(tile, p)) {
+      localFactor *= 0.84;
+    }
+
+    // 2) 间筋: 同对手已打出两侧端牌，降低中张风险
+    if (p && isNakasujiProtectedByPlayer(tile, p)) {
+      localFactor *= 0.82;
+    }
+
+    // 3) 早外: 该对手若早巡打出4/5/6，则该花色外侧牌(1/2/8/9)更安全
+    if (p && (n === 1 || n === 2 || n === 8 || n === 9)) {
+      const earlyTurn = earlyMiddleDiscardTurn(p, suit);
+      localFactor *= earlyOutsideFactor(earlyTurn);
+    }
+
+    localRisk *= clamp(localFactor, 0.35, 1);
+    return sum + localRisk;
+  }, 0) / models.length;
+
+  // 4) 壁牌/物理阻断: 全局可见牌决定的两面听上限修正
+  const kabeClass = classifyKabe(tile, visible);
+  const kFactor = kabeFactor(kabeClass);
+  const residual = kabeClass === 'no_chance' ? 0.012 : kabeClass === 'one_chance' ? 0.018 : 0.024;
+  const risk = perOpponent * kFactor + residual;
+  return clamp(risk, 0.03, 0.95);
+}
+
+function chooseHeuristicDiscard(hand: string[], models: OpponentModel[], game: RealtimeGame, visible: Record<string, number>) {
   const base = handStructureScore(hand);
   const uniq = [...new Set(hand)];
   const scored = uniq.map((tile) => {
     const after = removeOneTile(hand, tile);
     const loss = Math.max(0, base - handStructureScore(after));
-    const risk = discardRisk(tile, models);
+    const risk = discardRisk(tile, models, game, visible);
     const value = loss * 1.3 + risk * 10;
     return { tile, value };
   }).sort((a, b) => a.value - b.value);
@@ -550,21 +729,41 @@ function buildMetrics(game: RealtimeGame, analysis: LLMAnalysisResult | null): S
   const drawProb = unseenTotal > 0 ? clamp(drawRemain / unseenTotal, 0.01, 0.95) : 0.01;
   const preferred = analysis?.recommendedDiscard && myHand.includes(analysis.recommendedDiscard)
     ? analysis.recommendedDiscard
-    : chooseHeuristicDiscard(myHand, models);
-  const risk = discardRisk(preferred, models);
+    : chooseHeuristicDiscard(myHand, models, game, visible);
+  const risk = discardRisk(preferred, models, game, visible);
   const safeRate = clamp(1 - risk, 0.05, 0.97);
   const waitRisk = clamp(models.reduce((sum, m) => sum + m.tingProb, 0) / Math.max(1, models.length), 0.08, 0.9);
+  const preferredSujiProtected = sujiProtectionCount(preferred, game);
+  const preferredNakasujiProtected = [1, 2, 3].filter((pid) => isNakasujiProtectedByPlayer(preferred, game.players[pid])).length;
+  const preferredKabeClass = classifyKabe(preferred, visible);
 
   const safeTiles = [...new Set(myHand)]
-    .map((tile) => ({ tile, risk: discardRisk(tile, models) }))
+    .map((tile) => ({ tile, risk: discardRisk(tile, models, game, visible) }))
     .sort((a, b) => a.risk - b.risk)
     .slice(0, 4)
     .map((x) => x.tile);
 
+  const sujiHints = [...new Set(myHand)]
+    .map((tile) => ({ tile, protectedBy: sujiProtectionCount(tile, game) }))
+    .filter((x) => x.protectedBy > 0)
+    .sort((a, b) => b.protectedBy - a.protectedBy || tileSortValue(a.tile) - tileSortValue(b.tile))
+    .slice(0, 2)
+    .map((x) => x.tile);
+
+  const kabeHints = [...new Set(myHand)]
+    .map((tile) => ({ tile, kabe: classifyKabe(tile, visible) }))
+    .filter((x) => x.kabe !== 'normal')
+    .sort((a, b) => {
+      const rank = (k: KabeClass) => (k === 'no_chance' ? 0 : 1);
+      return rank(a.kabe) - rank(b.kabe) || tileSortValue(a.tile) - tileSortValue(b.tile);
+    })
+    .slice(0, 2)
+    .map((x) => `${x.tile}(${kabeLabel(x.kabe)})`);
+
   const phaseInsights = {
     draw: `重点观察 ${drawCandidates.slice(0, 2).map((x) => x.tile).join(' / ') || '无高价值进张'}；财神剩余约 ${magicRemain} 张`,
-    discard: `推荐舍牌 ${preferred}，预计安全率 ${pct(safeRate)}`,
-    wait: `三家听牌压力 ${pct(waitRisk)}，优先保留安全牌`
+    discard: `推荐舍牌 ${preferred}，预计安全率 ${pct(safeRate)}${preferredSujiProtected > 0 ? `（${preferredSujiProtected}家筋线）` : ''}${preferredNakasujiProtected > 0 ? `（${preferredNakasujiProtected}家间筋）` : ''}（${kabeLabel(preferredKabeClass)}）`,
+    wait: `三家听牌压力 ${pct(waitRisk)}，优先保留安全牌${sujiHints.length > 0 ? `；筋线候选 ${sujiHints.join(' / ')}` : ''}${kabeHints.length > 0 ? `；壁牌候选 ${kabeHints.join(' / ')}` : ''}（筋线/间筋仅覆盖两面听）`
   };
 
   return {
@@ -614,7 +813,7 @@ function appendLog(game: RealtimeGame, message: string) {
   game.lastAction = message;
   game.updatedAt = Date.now();
   game.logs.unshift(`[${nextCount}] ${message}`);
-  game.logs = game.logs.slice(0, 36);
+  game.logs = game.logs.slice(0, MAX_LOG_ENTRIES);
 }
 
 function resolveWaitPass(game: RealtimeGame) {
@@ -833,11 +1032,12 @@ export function AIAssistant() {
     setError('');
     try {
       const context = buildContext(snapshot);
+      const llmHistory = trimHistory(requestHistory, MAX_LLM_HISTORY_MESSAGES);
       const { result, stats: usageStats } = await requestMahjongLLM(
         config,
         context,
         userMessage,
-        requestHistory
+        llmHistory
       );
       setAnalysis(result);
       setStats(usageStats);
@@ -1355,19 +1555,19 @@ export function AIAssistant() {
     if (setupPhase !== '进行中' || !game) return;
     const result = await runLLM(game, `请根据当前阶段(${game.stage})提供本轮建议，并强调防止点炮。`, history);
     if (!result) return;
-    setHistory((prev) => [...prev, { role: 'assistant', content: result.chatReply }]);
+    setHistory((prev) => pushHistory(prev, { role: 'assistant', content: result.chatReply }, MAX_UI_HISTORY_MESSAGES));
   };
 
   const sendChat = async () => {
     if (setupPhase !== '进行中' || !game) return;
     const msg = chatInput.trim();
     if (!msg || isLLMRunning) return;
-    const nextHistory = [...history, { role: 'user' as const, content: msg }];
+    const nextHistory = pushHistory(history, { role: 'user' as const, content: msg }, MAX_UI_HISTORY_MESSAGES);
     setHistory(nextHistory);
     setChatInput('');
     const result = await runLLM(game, msg, nextHistory);
     if (!result) return;
-    setHistory((prev) => [...prev, { role: 'assistant', content: result.chatReply }]);
+    setHistory((prev) => pushHistory(prev, { role: 'assistant', content: result.chatReply }, MAX_UI_HISTORY_MESSAGES));
   };
 
   // 手牌选择辅助（开局输入手牌阶段）
@@ -1433,7 +1633,7 @@ export function AIAssistant() {
             当前: {game.players[game.currentPlayer].name} · {game.stage}
           </Badge>
           <Badge variant="outline">动作 {game.actionCount}</Badge>
-          <Badge variant="outline">牌数校验 {tileLedger.total}/108</Badge>
+          <Badge variant="outline">牌数校验 {tileLedger.total}/{TOTAL_TILE_COUNT}</Badge>
           <Badge variant="outline">财神剩余估计 {magicVisibleRemain}（翻开1张后）</Badge>
         </div>
       )}
